@@ -1,0 +1,6 @@
+tools/reference/
+bin/
+obj/
+*.user
+default.cfg
+global.cfg

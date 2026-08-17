@@ -1,0 +1,90 @@
+using System.Speech.Synthesis;
+using Ciribob.DCS.SimpleRadio.Standalone.Common.Audio.Opus;
+using Ciribob.DCS.SimpleRadio.Standalone.Common.Audio.Opus.Core;
+using Ciribob.DCS.SimpleRadio.Standalone.Common.Models;
+using Ciribob.DCS.SimpleRadio.Standalone.Common.Models.Player;
+using Ciribob.DCS.SimpleRadio.Standalone.Common.Network.Client;
+using NLog;
+
+namespace AtcListener;
+
+// Genera TTS y lo envia por el MISMO cliente/GUID que usamos para escuchar.
+// Importante: si usaramos un GUID distinto (como el exe externo DCS-SR-ExternalAudio),
+// el servidor SRS no sabe que es "nuestra propia voz" y nos la reenviaria, causando que
+// el reconocedor se escuche a si mismo (bug real observado en pruebas).
+public sealed class AtcVoiceTransmitter : IDisposable
+{
+    private const int SampleRate = 16000; // debe coincidir con Constants.MIC_SAMPLE_RATE de SRS
+    private const int FrameMs = 40;
+    private const int FrameBytes = SampleRate / 1000 * FrameMs * 2; // 640 muestras * 2 bytes = 1280
+
+    private readonly SpeechSynthesizer _synth = new();
+    private readonly OpusEncoder _encoder = OpusEncoder.Create(SampleRate, 1, Application.Voip);
+    private readonly UDPVoiceHandler _udpHandler;
+    private readonly double _freqHz;
+    private readonly Modulation _modulation;
+    private readonly uint _unitId;
+    private ulong _packetNumber;
+
+    public AtcVoiceTransmitter(UDPVoiceHandler udpHandler, double freqHz, Modulation modulation, uint unitId, string voiceName)
+    {
+        _udpHandler = udpHandler;
+        _freqHz = freqHz;
+        _modulation = modulation;
+        _unitId = unitId;
+
+        try
+        {
+            _synth.SelectVoice(voiceName);
+        }
+        catch (Exception)
+        {
+            // Se queda con la voz por defecto del sistema si el nombre no existe
+        }
+    }
+
+    public async Task SpeakAsync(string text, Logger logger)
+    {
+        logger.Info($"[TX] Respondiendo: \"{text}\"");
+
+        using var ms = new MemoryStream();
+        _synth.SetOutputToAudioStream(ms,
+            new System.Speech.AudioFormat.SpeechAudioFormatInfo(SampleRate,
+                System.Speech.AudioFormat.AudioBitsPerSample.Sixteen,
+                System.Speech.AudioFormat.AudioChannel.Mono));
+        _synth.Speak(text);
+        _synth.SetOutputToNull();
+
+        var pcm = ms.ToArray(); // SetOutputToAudioStream ya da PCM crudo, sin cabecera WAV
+        if (pcm.Length == 0) return;
+
+        var frameBuf = new byte[FrameBytes];
+        for (var offset = 0; offset + FrameBytes <= pcm.Length; offset += FrameBytes)
+        {
+            Buffer.BlockCopy(pcm, offset, frameBuf, 0, FrameBytes);
+            var encoded = _encoder.Encode(frameBuf, frameBuf.Length, out var encodedLength);
+            if (encodedLength <= 0) continue;
+
+            var packet = new UDPVoicePacket
+            {
+                AudioPart1Bytes = encoded[..encodedLength],
+                AudioPart1Length = (ushort)encodedLength,
+                Frequencies = [_freqHz],
+                Modulations = [(byte)_modulation],
+                Encryptions = [0],
+                UnitId = _unitId,
+                RetransmissionCount = 0,
+                PacketNumber = ++_packetNumber
+            };
+
+            _udpHandler.Send(packet);
+            await Task.Delay(FrameMs);
+        }
+    }
+
+    public void Dispose()
+    {
+        _synth.Dispose();
+        _encoder.Dispose();
+    }
+}
