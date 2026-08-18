@@ -21,16 +21,12 @@ public sealed class AtcVoiceTransmitter : IDisposable
     private readonly SpeechSynthesizer _synth = new();
     private readonly OpusEncoder _encoder = OpusEncoder.Create(SampleRate, 1, Application.Voip);
     private readonly UDPVoiceHandler _udpHandler;
-    private readonly double _freqHz;
-    private readonly Modulation _modulation;
     private readonly uint _unitId;
     private ulong _packetNumber;
 
-    public AtcVoiceTransmitter(UDPVoiceHandler udpHandler, double freqHz, Modulation modulation, uint unitId, string voiceName)
+    public AtcVoiceTransmitter(UDPVoiceHandler udpHandler, uint unitId, string voiceName)
     {
         _udpHandler = udpHandler;
-        _freqHz = freqHz;
-        _modulation = modulation;
         _unitId = unitId;
 
         try
@@ -43,9 +39,10 @@ public sealed class AtcVoiceTransmitter : IDisposable
         }
     }
 
-    public async Task SpeakAsync(string text, Logger logger)
+    // freqHz/modulation se indican por llamada - un mismo transmisor sirve a varios aerodromos.
+    public async Task SpeakAsync(string text, double freqHz, Modulation modulation, Logger logger)
     {
-        logger.Info($"[TX] Respondiendo: \"{text}\"");
+        logger.Info($"[TX] Respondiendo ({freqHz / 1_000_000.0:0.000} MHz {modulation}): \"{text}\"");
 
         using var ms = new MemoryStream();
         _synth.SetOutputToAudioStream(ms,
@@ -69,8 +66,8 @@ public sealed class AtcVoiceTransmitter : IDisposable
             {
                 AudioPart1Bytes = encoded[..encodedLength],
                 AudioPart1Length = (ushort)encodedLength,
-                Frequencies = [_freqHz],
-                Modulations = [(byte)_modulation],
+                Frequencies = [freqHz],
+                Modulations = [(byte)modulation],
                 Encryptions = [0],
                 UnitId = _unitId,
                 RetransmissionCount = 0,

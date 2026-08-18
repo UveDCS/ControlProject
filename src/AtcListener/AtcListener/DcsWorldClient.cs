@@ -2,6 +2,8 @@ using Grpc.Net.Client;
 using RurouniJones.Dcs.Grpc.V0.Atmosphere;
 using RurouniJones.Dcs.Grpc.V0.Common;
 using RurouniJones.Dcs.Grpc.V0.Mission;
+using RurouniJones.Dcs.Grpc.V0.Net;
+using RurouniJones.Dcs.Grpc.V0.World;
 
 namespace AtcListener;
 
@@ -12,12 +14,31 @@ public sealed class DcsWorldClient : IDisposable
     private readonly GrpcChannel _channel;
     private readonly MissionService.MissionServiceClient _mission;
     private readonly AtmosphereService.AtmosphereServiceClient _atmosphere;
+    private readonly WorldService.WorldServiceClient _world;
+    private readonly NetService.NetServiceClient _net;
 
     public DcsWorldClient(string host = "127.0.0.1", int port = 50051)
     {
         _channel = GrpcChannel.ForAddress($"http://{host}:{port}");
         _mission = new MissionService.MissionServiceClient(_channel);
         _atmosphere = new AtmosphereService.AtmosphereServiceClient(_channel);
+        _world = new WorldService.WorldServiceClient(_channel);
+        _net = new NetService.NetServiceClient(_channel);
+    }
+
+    // Nombres reales de los jugadores conectados en ese momento - se usan como callsigns
+    // reconocibles ademas de los fijos de la configuracion.
+    public async Task<IReadOnlyList<string>> GetConnectedPlayerNamesAsync()
+    {
+        var response = await _net.GetPlayersAsync(new GetPlayersRequest(), deadline: DateTime.UtcNow.AddSeconds(5));
+        return response.Players.Select(p => p.Name).Where(n => !string.IsNullOrWhiteSpace(n)).ToList();
+    }
+
+    public async Task<IReadOnlyList<Airbase>> GetAirbasesAsync()
+    {
+        var response = await _world.GetAirbasesAsync(new GetAirbasesRequest { Coalition = Coalition.All },
+            deadline: DateTime.UtcNow.AddSeconds(5));
+        return response.Airbases;
     }
 
     // Prueba de conectividad minima - confirma que hay una mision corriendo con DCS-gRPC activo.

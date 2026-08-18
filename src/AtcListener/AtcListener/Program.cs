@@ -1,11 +1,12 @@
-// Fase 0 - Prueba de concepto: escuchar audio entrante en SRS via External AWACS Mode (EAM),
-// decodificar Opus -> PCM, reconocer una gramatica minima con Windows Speech Recognition,
-// y responder por voz sobre la misma frecuencia. Cierra el bucle completo escuchar->entender->hablar.
+// Escucha audio entrante en SRS via External AWACS Mode (EAM) para uno o varios aerodromos
+// a la vez (cada uno en su propia frecuencia), decodifica Opus -> PCM, reconoce fraseologia
+// ATC con Windows Speech Recognition, y responde por voz en la frecuencia de ese aerodromo.
+// La configuracion (servidor SRS, DCS-gRPC, voz, callsigns, aerodromos) es editable en
+// atc-config.json, junto al ejecutable.
 
 using System.Net;
 using System.Speech.Recognition;
 using System.Text;
-using Ciribob.DCS.SimpleRadio.Standalone.Common.Audio.Opus.Core;
 using Ciribob.DCS.SimpleRadio.Standalone.Common.Models;
 using Ciribob.DCS.SimpleRadio.Standalone.Common.Models.EventMessages;
 using Ciribob.DCS.SimpleRadio.Standalone.Common.Models.Player;
@@ -16,42 +17,44 @@ using NLog;
 using AtcListener;
 using LogManager = NLog.LogManager;
 
-var config = new NLog.Config.LoggingConfiguration();
+var loggingConfig = new NLog.Config.LoggingConfiguration();
 var logconsole = new NLog.Targets.ConsoleTarget("logconsole")
 {
     Layout = "${longdate}|${level:uppercase=true}|${message}"
 };
-config.AddRule(LogLevel.Info, LogLevel.Fatal, logconsole);
-LogManager.Configuration = config;
+loggingConfig.AddRule(LogLevel.Info, LogLevel.Fatal, logconsole);
+LogManager.Configuration = loggingConfig;
 var logger = LogManager.GetCurrentClassLogger();
 
-const double TunedFrequencyHz = 251_000_000; // 251.0 MHz
-const Modulation TunedModulation = Modulation.AM;
-const string EamPassword = "atc123"; // debe coincidir con EXTERNAL_AWACS_MODE_BLUE_PASSWORD en server.cfg
-const int Coalition = 2; // 1 = Red, 2 = Blue
-const int Port = 5002;
 const int VoiceSampleRate = 16000; // misma tasa que usa SRS para voz (Constants.MIC_SAMPLE_RATE)
+const int MaxAirbases = 10; // Constants.MAX_RADIOS de SRS es 11 (radios[0] va sin usar)
 
-var guid = ShortGuid.NewGuid();
-var endpoint = new IPEndPoint(IPAddress.Loopback, Port);
+var configPath = Path.Combine(AppContext.BaseDirectory, "atc-config.json");
+var config = AtcConfig.LoadOrCreateDefault(configPath, logger);
 
-var radioInfo = new PlayerRadioInfoBase { unitId = 100001 };
-radioInfo.radios[1].freq = TunedFrequencyHz;
-radioInfo.radios[1].modulation = TunedModulation;
-
-var srClient = new SRClientBase
+if (args.Contains("--list-airbases"))
 {
-    ClientGuid = guid,
-    Name = "ATC-GCI-Listener",
-    Coalition = Coalition,
-    AllowRecord = false,
-    LatLngPosition = new LatLngPosition { lat = 33.5, lng = 36.3, alt = 500 },
-    RadioInfo = radioInfo
-};
+    using var dcs = new DcsWorldClient(config.Grpc.Host, config.Grpc.Port);
+    try
+    {
+        var airbases = await dcs.GetAirbasesAsync();
+        foreach (var ab in airbases.OrderBy(a => a.Name))
+        {
+            logger.Info($"[AIRBASE] {ab.Name} | coalicion={ab.Coalition} | lat={ab.Position.Lat:F4} lon={ab.Position.Lon:F4} alt={ab.Position.Alt:F0}");
+        }
+        logger.Info($"Total: {airbases.Count} aerodromos");
+    }
+    catch (Exception ex)
+    {
+        logger.Error($"[GRPC] No se pudo conectar - ¿hay una mision corriendo con DCS-gRPC activo? Detalle: {ex.Message}");
+    }
+
+    return;
+}
 
 if (args.Contains("--test-grpc"))
 {
-    using var dcs = new DcsWorldClient();
+    using var dcs = new DcsWorldClient(config.Grpc.Host, config.Grpc.Port);
     try
     {
         var time = await dcs.GetScenarioCurrentTimeAsync();
@@ -68,7 +71,70 @@ if (args.Contains("--test-grpc"))
     return;
 }
 
-var recognizer = SpeechSetup.CreateRecognizer(logger);
+if (config.Airbases.Count > MaxAirbases)
+{
+    logger.Warn($"La configuracion tiene {config.Airbases.Count} aerodromos, pero SRS solo admite {MaxAirbases} radios simultaneas por cliente. Se usaran solo los primeros {MaxAirbases}.");
+}
+
+var worldClient = new DcsWorldClient(config.Grpc.Host, config.Grpc.Port);
+var airbaseContexts = new List<AirbaseContext>();
+
+try
+{
+    var realAirbases = await worldClient.GetAirbasesAsync();
+
+    foreach (var abConfig in config.Airbases.Take(MaxAirbases))
+    {
+        var match = realAirbases.FirstOrDefault(a =>
+            string.Equals(a.Name, abConfig.Name, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.DisplayName, abConfig.Name, StringComparison.OrdinalIgnoreCase));
+
+        if (match != null)
+        {
+            logger.Info($"Aerodromo '{abConfig.Name}' resuelto en la mision -> {match.Name} ({match.Position.Lat:F4}, {match.Position.Lon:F4})");
+            airbaseContexts.Add(new AirbaseContext(abConfig, match.Position.Lat, match.Position.Lon, match.Position.Alt, logger));
+        }
+        else
+        {
+            logger.Warn($"No se encontro '{abConfig.Name}' en la mision actual - el viento de ese aerodromo caera a 'viento calma'. Revisa el nombre en {configPath} (usa --list-airbases para ver los nombres reales).");
+            airbaseContexts.Add(new AirbaseContext(abConfig, 0, 0, 0, logger));
+        }
+    }
+}
+catch (Exception ex)
+{
+    logger.Warn($"No se pudo conectar a DCS-gRPC para resolver aerodromos ({ex.Message}). El ATC seguira funcionando, pero el viento sera siempre 'viento calma' hasta que haya una mision corriendo.");
+    foreach (var abConfig in config.Airbases.Take(MaxAirbases))
+        airbaseContexts.Add(new AirbaseContext(abConfig, 0, 0, 0, logger));
+}
+
+if (airbaseContexts.Count == 0)
+{
+    logger.Error($"No hay ningun aerodromo configurado en {configPath}. Añade al menos uno y vuelve a arrancar.");
+    return;
+}
+
+var livePlayerNames = Array.Empty<string>();
+try
+{
+    livePlayerNames = (await worldClient.GetConnectedPlayerNamesAsync()).ToArray();
+    logger.Info(livePlayerNames.Length > 0
+        ? $"Jugadores conectados detectados como callsigns: {string.Join(", ", livePlayerNames)}"
+        : "No hay jugadores conectados todavia - se usaran solo los callsigns fijos de la configuracion.");
+}
+catch (Exception ex)
+{
+    logger.Warn($"No se pudo obtener la lista de jugadores via DCS-gRPC ({ex.Message}) - se usaran solo los callsigns fijos de la configuracion.");
+}
+
+var allCallsigns = config.Callsigns
+    .Concat(livePlayerNames)
+    .Select(CallsignNormalizer.ForGrammar)
+    .Where(c => c.Length > 0)
+    .Distinct()
+    .ToArray();
+
+var recognizer = SpeechSetup.CreateRecognizer(logger, allCallsigns);
 if (recognizer == null)
 {
     logger.Error("No hay ningun motor de reconocimiento de voz instalado en Windows. Instala uno desde Configuracion > Hora e idioma > Voz.");
@@ -77,14 +143,14 @@ if (recognizer == null)
 
 if (args.Contains("--test-grammar"))
 {
+    var firstCallsign = allCallsigns.FirstOrDefault() ?? "viper uno";
     string[] samples =
     [
-        "viper uno solicito rodaje",
-        "viper dos listo para despegue",
-        "viper uno listo para despegue",
-        "enfield uno uno solicito rodaje",
-        "enfield uno uno solicito aproximacion",
-        "enfield uno uno en final"
+        $"{firstCallsign} solicito rodaje",
+        $"{firstCallsign} listo para despegue",
+        $"{firstCallsign} solicito aproximacion",
+        $"{firstCallsign} en final",
+        "viper uno uno solicito rodaje" // prueba: callsign configurado como "Viper 1-1" pronunciado como palabras
     ];
 
     foreach (var sample in samples)
@@ -104,15 +170,36 @@ if (args.Contains("--test-grammar"))
     return;
 }
 
-var listener = new AtcListenerClient(guid, srClient, endpoint, EamPassword, TunedFrequencyHz, TunedModulation,
-    VoiceSampleRate, recognizer, logger);
+var guid = ShortGuid.NewGuid();
+var endpoint = new IPEndPoint(IPAddress.Parse(config.Srs.Host), config.Srs.Port);
+
+var radioInfo = new PlayerRadioInfoBase { unitId = 100001 };
+for (var i = 0; i < airbaseContexts.Count; i++)
+{
+    radioInfo.radios[i + 1].freq = airbaseContexts[i].FrequencyHz;
+    radioInfo.radios[i + 1].modulation = airbaseContexts[i].Modulation;
+    logger.Info($"Radio {i + 1}: {airbaseContexts[i].Name} en {airbaseContexts[i].FrequencyHz / 1_000_000.0:0.000} MHz {airbaseContexts[i].Modulation}");
+}
+
+var srClient = new SRClientBase
+{
+    ClientGuid = guid,
+    Name = "ATC-GCI",
+    Coalition = config.Srs.Coalition,
+    AllowRecord = false,
+    LatLngPosition = new LatLngPosition(),
+    RadioInfo = radioInfo
+};
+
+var listener = new AtcListenerClient(guid, srClient, endpoint, config.Srs.EamPassword, airbaseContexts,
+    VoiceSampleRate, recognizer, worldClient, config.Voice, logger);
 await listener.RunAsync();
 
 // ---
 
 internal static class SpeechSetup
 {
-    public static SpeechRecognitionEngine? CreateRecognizer(Logger logger)
+    public static SpeechRecognitionEngine? CreateRecognizer(Logger logger, string[] callsigns)
     {
         var installed = SpeechRecognitionEngine.InstalledRecognizers();
         logger.Info($"Motores de reconocimiento instalados: {string.Join(", ", installed.Select(r => $"{r.Culture} ({r.Name})"))}");
@@ -126,7 +213,7 @@ internal static class SpeechSetup
         logger.Info($"Usando motor: {chosen.Culture} - {chosen.Name}");
 
         var engine = new SpeechRecognitionEngine(chosen);
-        engine.LoadGrammar(AtcGrammar.Build(chosen.Culture));
+        engine.LoadGrammar(AtcGrammar.Build(chosen.Culture, callsigns));
 
         return engine;
     }
@@ -169,29 +256,17 @@ public class AtcListenerClient(
     SRClientBase srClient,
     IPEndPoint endpoint,
     string eamPassword,
-    double tunedFrequencyHz,
-    Modulation tunedModulation,
+    List<AirbaseContext> airbases,
     int voiceSampleRate,
     SpeechRecognitionEngine recognizer,
+    DcsWorldClient worldClient,
+    string voiceName,
     Logger logger)
     : IHandle<TCPClientStatusMessage>
 {
-    private static readonly TimeSpan TransmissionEndGap = TimeSpan.FromMilliseconds(500);
-
     private TCPClientHandler? _tcpHandler;
     private UDPVoiceHandler? _udpHandler;
     private readonly TaskCompletionSource _stopped = new();
-
-    private readonly OpusDecoder _decoder = OpusDecoder.Create(16000, 1);
-    private readonly MemoryStream _pcmBuffer = new();
-    private readonly object _bufferLock = new();
-    private DateTime _lastPacketAt = DateTime.MinValue;
-    private bool _hasAudio;
-    private readonly DcsWorldClient _worldClient = new();
-
-    private readonly AtcStateMachine _stateMachine = new(
-        srClient.LatLngPosition.lat, srClient.LatLngPosition.lng, srClient.LatLngPosition.alt, logger);
-
     private AtcVoiceTransmitter? _voiceTransmitter;
 
     public async Task RunAsync()
@@ -212,7 +287,7 @@ public class AtcListenerClient(
     {
         if (message.Connected)
         {
-            logger.Info("TCP conectado - solicitando autenticacion EAM (coalicion Azul)...");
+            logger.Info("TCP conectado - solicitando autenticacion EAM...");
             await EventBus.Instance.PublishOnUIThreadAsync(new EAMConnectRequestMessage
             {
                 Password = eamPassword,
@@ -221,13 +296,12 @@ public class AtcListenerClient(
 
             await Task.Delay(500);
 
-            logger.Info($"Anunciando radio sintonizada: {tunedFrequencyHz / 1_000_000.0:0.000} MHz {tunedModulation}");
-
             _udpHandler = new UDPVoiceHandler(guid, endpoint);
             _udpHandler.Connect();
 
-            _voiceTransmitter = new AtcVoiceTransmitter(_udpHandler, tunedFrequencyHz, tunedModulation,
-                srClient.RadioInfo.unitId, "Microsoft Helena Desktop");
+            _voiceTransmitter = new AtcVoiceTransmitter(_udpHandler, srClient.RadioInfo.unitId, voiceName);
+
+            logger.Info($"Listo. Controlando {airbases.Count} aerodromo(s).");
         }
         else
         {
@@ -250,29 +324,25 @@ public class AtcListenerClient(
             var packet = UDPVoicePacket.DecodeVoicePacket(raw);
             if (packet == null || packet.AudioPart1Bytes == null) continue;
 
-            var matches = false;
-            for (var i = 0; i < packet.Frequencies.Length; i++)
-            {
-                if (RadioBase.FreqCloseEnough(packet.Frequencies[i], tunedFrequencyHz)
-                    && (Modulation)packet.Modulations[i] == tunedModulation)
-                {
-                    matches = true;
-                    break;
-                }
-            }
+            var airbase = FindMatchingAirbase(packet);
+            if (airbase == null) continue;
 
-            if (!matches) continue;
-
-            var decoded = _decoder.Decode(packet.AudioPart1Bytes, packet.AudioPart1Length, out var decodedLength);
-            if (decodedLength <= 0) continue;
-
-            lock (_bufferLock)
-            {
-                _pcmBuffer.Write(decoded, 0, decodedLength);
-                _lastPacketAt = DateTime.UtcNow;
-                _hasAudio = true;
-            }
+            airbase.AppendAudio(packet.AudioPart1Bytes, packet.AudioPart1Length);
         }
+    }
+
+    private AirbaseContext? FindMatchingAirbase(UDPVoicePacket packet)
+    {
+        for (var i = 0; i < packet.Frequencies.Length; i++)
+        {
+            var modulation = (Modulation)packet.Modulations[i];
+            var airbase = airbases.FirstOrDefault(a =>
+                RadioBase.FreqCloseEnough(packet.Frequencies[i], a.FrequencyHz) && a.Modulation == modulation);
+
+            if (airbase != null) return airbase;
+        }
+
+        return null;
     }
 
     private async Task WatchForTransmissionEndAsync()
@@ -281,28 +351,20 @@ public class AtcListenerClient(
         {
             await Task.Delay(150);
 
-            byte[]? pcmToRecognize = null;
-
-            lock (_bufferLock)
+            foreach (var airbase in airbases)
             {
-                if (_hasAudio && DateTime.UtcNow - _lastPacketAt > TransmissionEndGap)
+                var pcm = airbase.TakeCompletedTransmission();
+                if (pcm is { Length: > 0 })
                 {
-                    pcmToRecognize = _pcmBuffer.ToArray();
-                    _pcmBuffer.SetLength(0);
-                    _hasAudio = false;
+                    await RecognizeAndRespondAsync(airbase, pcm);
                 }
-            }
-
-            if (pcmToRecognize is { Length: > 0 })
-            {
-                await RecognizeAndRespondAsync(pcmToRecognize);
             }
         }
     }
 
-    private async Task RecognizeAndRespondAsync(byte[] pcm16Mono)
+    private async Task RecognizeAndRespondAsync(AirbaseContext airbase, byte[] pcm16Mono)
     {
-        logger.Info($"Fin de transmision detectado ({pcm16Mono.Length} bytes PCM) - reconociendo...");
+        logger.Info($"[{airbase.Name}] Fin de transmision detectado ({pcm16Mono.Length} bytes PCM) - reconociendo...");
 
         var wavBytes = WavHelper.BuildWav(pcm16Mono, voiceSampleRate);
         using var wavStream = new MemoryStream(wavBytes);
@@ -313,7 +375,7 @@ public class AtcListenerClient(
 
         if (result == null)
         {
-            logger.Info("[STT] No se reconocio ninguna frase de la gramatica.");
+            logger.Info($"[{airbase.Name}] [STT] No se reconocio ninguna frase de la gramatica.");
             return;
         }
 
@@ -322,13 +384,13 @@ public class AtcListenerClient(
 
         if (callsign == null || intentValue == null || !Enum.TryParse<AtcIntent>(intentValue, out var intent))
         {
-            logger.Info($"[STT] Reconocido pero sin semantica valida: \"{result.Text}\"");
+            logger.Info($"[{airbase.Name}] [STT] Reconocido pero sin semantica valida: \"{result.Text}\"");
             return;
         }
 
-        logger.Info($"[STT] {callsign} -> {intent} (texto: \"{result.Text}\", confianza {result.Confidence:P0})");
+        logger.Info($"[{airbase.Name}] [STT] {callsign} -> {intent} (texto: \"{result.Text}\", confianza {result.Confidence:P0})");
 
-        var response = await _stateMachine.HandleAsync(callsign, intent, _worldClient);
+        var response = await airbase.StateMachine.HandleAsync(callsign, intent, worldClient);
 
         if (_voiceTransmitter == null)
         {
@@ -336,6 +398,6 @@ public class AtcListenerClient(
             return;
         }
 
-        await _voiceTransmitter.SpeakAsync(response, logger);
+        await _voiceTransmitter.SpeakAsync(response, airbase.FrequencyHz, airbase.Modulation, logger);
     }
 }

@@ -16,10 +16,10 @@ public static class AtcGrammar
         ("en final", AtcIntent.ReporteFinal)
     ];
 
-    public static Grammar Build(CultureInfo culture)
+    public static Grammar Build(CultureInfo culture, string[] callsigns)
     {
         var callsignChoiceBuilder = new GrammarBuilder { Culture = culture };
-        callsignChoiceBuilder.Append(new Choices(CallsignRegistry.Known));
+        callsignChoiceBuilder.Append(new Choices(callsigns));
 
         var alternatives = IntentPhrases.Select(entry =>
         {

@@ -2,14 +2,17 @@ using NLog;
 
 namespace AtcListener;
 
-// Fase 1: maquina de estados por callsign. Pista y ruta siguen fijas (mock);
-// Fase 2: el viento ya viene de la mision real via DCS-gRPC, con reserva a "viento calma"
-// si no hay conexion (para que el ATC siga funcionando sin DCS abierto).
-public class AtcStateMachine(double referenceLat, double referenceLon, double referenceAlt, Logger logger)
+// Maquina de estados por callsign, para UN aerodromo concreto (pista/ruta vienen de su
+// configuracion). El viento viene de la mision real via DCS-gRPC, con reserva a
+// "viento calma" si no hay conexion (para que el ATC siga funcionando sin DCS abierto).
+public class AtcStateMachine(
+    string runway,
+    string taxiRoute,
+    double referenceLat,
+    double referenceLon,
+    double referenceAlt,
+    Logger logger)
 {
-    private const string Pista = "dos uno";
-    private const string RutaRodaje = "alfa";
-
     private readonly Dictionary<string, AircraftState> _states = new();
 
     public async Task<string> HandleAsync(string callsign, AtcIntent intent, DcsWorldClient worldClient)
@@ -21,14 +24,14 @@ public class AtcStateMachine(double referenceLat, double referenceLon, double re
         {
             case AtcIntent.SolicitarRodaje when state == AircraftState.SinContacto:
                 _states[callsign] = AircraftState.RodajeAutorizado;
-                return $"{name}, ruede a pista {Pista} vía {RutaRodaje}, mantenga posición en punto de espera";
+                return $"{name}, ruede a pista {runway} vía {taxiRoute}, mantenga posición en punto de espera";
 
             case AtcIntent.SolicitarRodaje:
                 return $"{name}, ya tiene autorización de rodaje";
 
             case AtcIntent.ListoParaDespegue when state == AircraftState.RodajeAutorizado:
                 _states[callsign] = AircraftState.DespegueAutorizado;
-                return $"{name}, {await DescribeWindAsync(worldClient)}, pista {Pista}, autorizado despegue";
+                return $"{name}, {await DescribeWindAsync(worldClient)}, pista {runway}, autorizado despegue";
 
             case AtcIntent.ListoParaDespegue when state == AircraftState.DespegueAutorizado:
                 return $"{name}, ya tiene autorización de despegue";
@@ -38,14 +41,14 @@ public class AtcStateMachine(double referenceLat, double referenceLon, double re
 
             case AtcIntent.SolicitarAproximacion when state == AircraftState.SinContacto:
                 _states[callsign] = AircraftState.AproximacionAutorizada;
-                return $"{name}, autorizado aproximación pista {Pista}, reporte en final";
+                return $"{name}, autorizado aproximación pista {runway}, reporte en final";
 
             case AtcIntent.SolicitarAproximacion:
                 return $"{name}, ya tiene autorización de aproximación";
 
             case AtcIntent.ReporteFinal when state == AircraftState.AproximacionAutorizada:
                 _states[callsign] = AircraftState.AutorizadoAterrizaje;
-                return $"{name}, {await DescribeWindAsync(worldClient)}, pista {Pista}, autorizado a aterrizar";
+                return $"{name}, {await DescribeWindAsync(worldClient)}, pista {runway}, autorizado a aterrizar";
 
             case AtcIntent.ReporteFinal when state == AircraftState.AutorizadoAterrizaje:
                 return $"{name}, ya tiene autorización de aterrizaje";
