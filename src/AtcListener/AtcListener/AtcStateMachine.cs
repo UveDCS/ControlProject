@@ -1,16 +1,18 @@
+using NLog;
+
 namespace AtcListener;
 
-// Fase 1 - maquina de estados por callsign. Pista, ruta y viento son fijos (mock);
-// en Fase 2 vendran del estado real de la mision via DCS-gRPC.
-public class AtcStateMachine
+// Fase 1: maquina de estados por callsign. Pista y ruta siguen fijas (mock);
+// Fase 2: el viento ya viene de la mision real via DCS-gRPC, con reserva a "viento calma"
+// si no hay conexion (para que el ATC siga funcionando sin DCS abierto).
+public class AtcStateMachine(double referenceLat, double referenceLon, double referenceAlt, Logger logger)
 {
     private const string Pista = "dos uno";
     private const string RutaRodaje = "alfa";
-    private const string Viento = "viento calma";
 
     private readonly Dictionary<string, AircraftState> _states = new();
 
-    public string Handle(string callsign, AtcIntent intent)
+    public async Task<string> HandleAsync(string callsign, AtcIntent intent, DcsWorldClient worldClient)
     {
         var state = _states.GetValueOrDefault(callsign, AircraftState.SinContacto);
         var name = Capitalize(callsign);
@@ -26,7 +28,7 @@ public class AtcStateMachine
 
             case AtcIntent.ListoParaDespegue when state == AircraftState.RodajeAutorizado:
                 _states[callsign] = AircraftState.DespegueAutorizado;
-                return $"{name}, {Viento}, pista {Pista}, autorizado despegue";
+                return $"{name}, {await DescribeWindAsync(worldClient)}, pista {Pista}, autorizado despegue";
 
             case AtcIntent.ListoParaDespegue when state == AircraftState.DespegueAutorizado:
                 return $"{name}, ya tiene autorización de despegue";
@@ -43,7 +45,7 @@ public class AtcStateMachine
 
             case AtcIntent.ReporteFinal when state == AircraftState.AproximacionAutorizada:
                 _states[callsign] = AircraftState.AutorizadoAterrizaje;
-                return $"{name}, {Viento}, pista {Pista}, autorizado a aterrizar";
+                return $"{name}, {await DescribeWindAsync(worldClient)}, pista {Pista}, autorizado a aterrizar";
 
             case AtcIntent.ReporteFinal when state == AircraftState.AutorizadoAterrizaje:
                 return $"{name}, ya tiene autorización de aterrizaje";
@@ -53,6 +55,23 @@ public class AtcStateMachine
 
             default:
                 return $"{name}, repita, no entendido";
+        }
+    }
+
+    private async Task<string> DescribeWindAsync(DcsWorldClient worldClient)
+    {
+        try
+        {
+            var (headingDeg, strengthMs) = await worldClient.GetWindAsync(referenceLat, referenceLon, referenceAlt);
+
+            if (strengthMs < 1.0f) return "viento calma";
+
+            return $"viento {Math.Round(headingDeg)} grados, {strengthMs:F0} metros por segundo";
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"No se pudo obtener el viento real via DCS-gRPC, usando valor por defecto: {ex.Message}");
+            return "viento calma";
         }
     }
 

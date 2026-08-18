@@ -187,7 +187,11 @@ public class AtcListenerClient(
     private readonly object _bufferLock = new();
     private DateTime _lastPacketAt = DateTime.MinValue;
     private bool _hasAudio;
-    private readonly AtcStateMachine _stateMachine = new();
+    private readonly DcsWorldClient _worldClient = new();
+
+    private readonly AtcStateMachine _stateMachine = new(
+        srClient.LatLngPosition.lat, srClient.LatLngPosition.lng, srClient.LatLngPosition.alt, logger);
+
     private AtcVoiceTransmitter? _voiceTransmitter;
 
     public async Task RunAsync()
@@ -324,7 +328,7 @@ public class AtcListenerClient(
 
         logger.Info($"[STT] {callsign} -> {intent} (texto: \"{result.Text}\", confianza {result.Confidence:P0})");
 
-        var response = _stateMachine.Handle(callsign, intent);
+        var response = await _stateMachine.HandleAsync(callsign, intent, _worldClient);
 
         if (_voiceTransmitter == null)
         {
