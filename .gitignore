@@ -1,4 +1,5 @@
 tools/reference/
+tools/dcs-grpc/
 bin/
 obj/
 *.user

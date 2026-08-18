@@ -49,6 +49,25 @@ var srClient = new SRClientBase
     RadioInfo = radioInfo
 };
 
+if (args.Contains("--test-grpc"))
+{
+    using var dcs = new DcsWorldClient();
+    try
+    {
+        var time = await dcs.GetScenarioCurrentTimeAsync();
+        logger.Info($"[GRPC] Conectado. Hora del escenario: {time}");
+
+        var (heading, strength) = await dcs.GetWindAsync(33.5, 36.3, 500);
+        logger.Info($"[GRPC] Viento en (33.5, 36.3): rumbo {heading:F0} grados, {strength:F1} m/s");
+    }
+    catch (Exception ex)
+    {
+        logger.Error($"[GRPC] No se pudo conectar - ¿hay una mision corriendo con DCS-gRPC activo? Detalle: {ex.Message}");
+    }
+
+    return;
+}
+
 var recognizer = SpeechSetup.CreateRecognizer(logger);
 if (recognizer == null)
 {
