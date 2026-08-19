@@ -362,6 +362,10 @@ public class AtcListenerClient(
         }
     }
 
+    // Por debajo de esto se considera ruido/clic de PTT, no un intento real de hablar
+    // (unos 300ms a 16kHz mono 16-bit) - evita que el ATC diga "repita" por cualquier ruido.
+    private const int MinMeaningfulPcmBytes = 10_000;
+
     private async Task RecognizeAndRespondAsync(AirbaseContext airbase, byte[] pcm16Mono)
     {
         logger.Info($"[{airbase.Name}] Fin de transmision detectado ({pcm16Mono.Length} bytes PCM) - reconociendo...");
@@ -373,31 +377,47 @@ public class AtcListenerClient(
         var result = recognizer.Recognize();
         recognizer.SetInputToNull();
 
-        if (result == null)
+        string? callsign = null;
+        AtcIntent? intent = null;
+
+        if (result != null)
         {
-            logger.Info($"[{airbase.Name}] [STT] No se reconocio ninguna frase de la gramatica.");
+            callsign = result.Semantics.ContainsKey("callsign") ? result.Semantics["callsign"].Value as string : null;
+            var intentValue = result.Semantics.ContainsKey("intent") ? result.Semantics["intent"].Value as string : null;
+            if (intentValue != null && Enum.TryParse<AtcIntent>(intentValue, out var parsedIntent))
+                intent = parsedIntent;
+        }
+
+        if (callsign == null || intent == null)
+        {
+            logger.Info(result == null
+                ? $"[{airbase.Name}] [STT] No se reconocio ninguna frase de la gramatica."
+                : $"[{airbase.Name}] [STT] Reconocido pero sin semantica valida: \"{result!.Text}\"");
+
+            if (pcm16Mono.Length < MinMeaningfulPcmBytes)
+            {
+                logger.Info($"[{airbase.Name}] Transmision demasiado corta para ser un intento real - se ignora sin responder.");
+                return;
+            }
+
+            await SpeakAsync(airbase, "Repita, no se ha entendido");
             return;
         }
 
-        var callsign = result.Semantics.ContainsKey("callsign") ? result.Semantics["callsign"].Value as string : null;
-        var intentValue = result.Semantics.ContainsKey("intent") ? result.Semantics["intent"].Value as string : null;
+        logger.Info($"[{airbase.Name}] [STT] {callsign} -> {intent} (texto: \"{result!.Text}\", confianza {result.Confidence:P0})");
 
-        if (callsign == null || intentValue == null || !Enum.TryParse<AtcIntent>(intentValue, out var intent))
-        {
-            logger.Info($"[{airbase.Name}] [STT] Reconocido pero sin semantica valida: \"{result.Text}\"");
-            return;
-        }
+        var response = await airbase.StateMachine.HandleAsync(callsign, intent.Value, worldClient);
+        await SpeakAsync(airbase, response);
+    }
 
-        logger.Info($"[{airbase.Name}] [STT] {callsign} -> {intent} (texto: \"{result.Text}\", confianza {result.Confidence:P0})");
-
-        var response = await airbase.StateMachine.HandleAsync(callsign, intent, worldClient);
-
+    private async Task SpeakAsync(AirbaseContext airbase, string text)
+    {
         if (_voiceTransmitter == null)
         {
             logger.Error("Transmisor de voz no listo todavia - respuesta perdida.");
             return;
         }
 
-        await _voiceTransmitter.SpeakAsync(response, airbase.FrequencyHz, airbase.Modulation, logger);
+        await _voiceTransmitter.SpeakAsync(text, airbase.FrequencyHz, airbase.Modulation, logger);
     }
 }

@@ -21,8 +21,12 @@ public class AtcConfig
             Name = "EJEMPLO - cambia esto por un nombre real de --list-airbases",
             FrequencyMhz = 251.0,
             Modulation = "AM",
-            Runway = "dos uno",
-            TaxiRoute = "alfa"
+            TaxiRoute = "alfa",
+            Runways =
+            [
+                new RunwayConfig { Name = "dos uno", HeadingDeg = 210 },
+                new RunwayConfig { Name = "cero tres", HeadingDeg = 30 }
+            ]
         }
     ];
 
@@ -70,6 +74,16 @@ public class AirbaseConfig
     public string Name { get; set; } = "";
     public double FrequencyMhz { get; set; }
     public string Modulation { get; set; } = "AM";
-    public string Runway { get; set; } = "dos uno";
     public string TaxiRoute { get; set; } = "alfa";
+
+    // DCS-gRPC no expone las pistas fisicas de un aerodromo, asi que las declaramos
+    // aqui con su rumbo real (se puede sacar de cualquier carta de navegacion). El
+    // programa elige la mas alineada con el viento real de la mision en cada momento.
+    public List<RunwayConfig> Runways { get; set; } = [new RunwayConfig { Name = "dos uno", HeadingDeg = 210 }];
+}
+
+public class RunwayConfig
+{
+    public string Name { get; set; } = "";
+    public double HeadingDeg { get; set; }
 }

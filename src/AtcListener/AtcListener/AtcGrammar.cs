@@ -13,7 +13,8 @@ public static class AtcGrammar
         ("listo para despegue", AtcIntent.ListoParaDespegue),
         ("en posicion listo", AtcIntent.ListoParaDespegue),
         ("solicito aproximacion", AtcIntent.SolicitarAproximacion),
-        ("en final", AtcIntent.ReporteFinal)
+        ("en final", AtcIntent.ReporteFinal),
+        ("pista despejada", AtcIntent.PistaDespejada)
     ];
 
     public static Grammar Build(CultureInfo culture, string[] callsigns)

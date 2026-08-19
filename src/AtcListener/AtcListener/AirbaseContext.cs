@@ -17,7 +17,7 @@ public sealed class AirbaseContext(AirbaseConfig config, double lat, double lon,
     public Modulation Modulation { get; } = Enum.Parse<Modulation>(config.Modulation, ignoreCase: true);
 
     public AtcStateMachine StateMachine { get; } =
-        new(config.Runway, config.TaxiRoute, lat, lon, alt, logger);
+        new(config.Runways, config.TaxiRoute, lat, lon, alt, logger);
 
     private readonly OpusDecoder _decoder = OpusDecoder.Create(16000, 1);
     private readonly MemoryStream _pcmBuffer = new();

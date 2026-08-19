@@ -5,5 +5,6 @@ public enum AtcIntent
     SolicitarRodaje,
     ListoParaDespegue,
     SolicitarAproximacion,
-    ReporteFinal
+    ReporteFinal,
+    PistaDespejada
 }
