@@ -14,6 +14,16 @@ public class AtcConfig
     public GrpcConfig Grpc { get; set; } = new();
     public string Voice { get; set; } = "Microsoft Helena Desktop";
     public string[] Callsigns { get; set; } = ["viper uno", "viper dos", "enfield uno uno"];
+
+    // Asigna un callsign fijo a un jugador de multijugador por su nombre real -
+    // asi un nick raro no es un problema, y ademas nos deja saber a que jugador
+    // real corresponde ese callsign para poder rastrear su posicion (guiado en
+    // aproximacion). Requiere DISTANCE_ENABLED=true (o LOS_ENABLED) en el server.cfg
+    // de SRS, si no todas las posiciones llegan como 0,0 por privacidad.
+    public List<PlayerCallsignConfig> PlayerCallsigns { get; set; } =
+    [
+        new PlayerCallsignConfig { PlayerName = "Uve", Callsign = "Sierra 7-1" }
+    ];
     public List<AirbaseConfig> Airbases { get; set; } =
     [
         new AirbaseConfig
@@ -86,4 +96,10 @@ public class RunwayConfig
 {
     public string Name { get; set; } = "";
     public double HeadingDeg { get; set; }
+}
+
+public class PlayerCallsignConfig
+{
+    public string PlayerName { get; set; } = "";
+    public string Callsign { get; set; } = "";
 }

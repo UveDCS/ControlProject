@@ -25,13 +25,18 @@ public class AtcStateMachine(
 
         switch (intent)
         {
-            case AtcIntent.SolicitarRodaje when state == AircraftState.SinContacto:
+            // SinContacto (recien conectado) o AutorizadoAterrizaje (acaba de aterrizar y
+            // quiere rodar/despegar otra vez) son los dos puntos validos para EMPEZAR un rodaje.
+            case AtcIntent.SolicitarRodaje when state is AircraftState.SinContacto or AircraftState.AutorizadoAterrizaje:
                 _states[callsign] = AircraftState.RodajeAutorizado;
                 var (rodajePista, _) = await GetActiveRunwayAndWindAsync(worldClient);
                 return $"{name}, ruede a pista {rodajePista} vía {taxiRoute}, mantenga posición en punto de espera";
 
-            case AtcIntent.SolicitarRodaje:
+            case AtcIntent.SolicitarRodaje when state == AircraftState.RodajeAutorizado:
                 return $"{name}, ya tiene autorización de rodaje";
+
+            case AtcIntent.SolicitarRodaje:
+                return $"{name}, negativo";
 
             case AtcIntent.ListoParaDespegue when state == AircraftState.RodajeAutorizado:
             {
@@ -50,13 +55,19 @@ public class AtcStateMachine(
             case AtcIntent.ListoParaDespegue:
                 return $"{name}, negativo, no tiene autorización de rodaje";
 
-            case AtcIntent.SolicitarAproximacion when state == AircraftState.SinContacto:
+            // SinContacto (llega directamente pidiendo aproximacion, sin haber rodado antes -
+            // p.ej. viene de otra base) o DespegueAutorizado (ya voló, ahora vuelve) son los dos
+            // puntos validos para EMPEZAR una aproximacion.
+            case AtcIntent.SolicitarAproximacion when state is AircraftState.SinContacto or AircraftState.DespegueAutorizado:
                 _states[callsign] = AircraftState.AproximacionAutorizada;
                 var (aproxPista, _) = await GetActiveRunwayAndWindAsync(worldClient);
                 return $"{name}, autorizado aproximación pista {aproxPista}, reporte en final";
 
-            case AtcIntent.SolicitarAproximacion:
+            case AtcIntent.SolicitarAproximacion when state == AircraftState.AproximacionAutorizada:
                 return $"{name}, ya tiene autorización de aproximación";
+
+            case AtcIntent.SolicitarAproximacion:
+                return $"{name}, negativo";
 
             case AtcIntent.ReporteFinal when state == AircraftState.AproximacionAutorizada:
             {
@@ -87,6 +98,11 @@ public class AtcStateMachine(
         }
     }
 
+    // Callsigns a los que se les autorizo aproximacion y aun no han reportado "en final" -
+    // son los candidatos a recibir guiado activo por radar (vectores) mientras se acercan.
+    public IReadOnlyList<string> GetCallsignsInApproach() =>
+        _states.Where(kv => kv.Value == AircraftState.AproximacionAutorizada).Select(kv => kv.Key).ToList();
+
     private async Task<(string RunwayName, string WindPhrase)> GetActiveRunwayAndWindAsync(DcsWorldClient worldClient)
     {
         var fallbackRunway = runways.FirstOrDefault()?.Name ?? "desconocida";
@@ -115,7 +131,7 @@ public class AtcStateMachine(
         return diff > 180 ? 360 - diff : diff;
     }
 
-    private static string Capitalize(string callsign) =>
+    public static string Capitalize(string callsign) =>
         string.Join(' ', callsign.Split(' ', StringSplitOptions.RemoveEmptyEntries)
             .Select(w => char.ToUpperInvariant(w[0]) + w[1..]));
 }

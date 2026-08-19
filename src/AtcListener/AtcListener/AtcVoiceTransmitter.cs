@@ -55,27 +55,39 @@ public sealed class AtcVoiceTransmitter : IDisposable
         var pcm = ms.ToArray(); // SetOutputToAudioStream ya da PCM crudo, sin cabecera WAV
         if (pcm.Length == 0) return;
 
+        // Temporizador periodico en vez de Task.Delay en bucle: Task.Delay acumula deriva
+        // (el trabajo de cada vuelta tarda algo, asi que "40ms de delay" se convierte en
+        // "40ms + lo que tarde el resto" real) y eso generaba huecos entre paquetes que el
+        // cliente SRS interpretaba como sueltas de PTT (sonido entrecortado, confirmado en pruebas).
+        using var frameTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(FrameMs));
+
         var frameBuf = new byte[FrameBytes];
-        for (var offset = 0; offset + FrameBytes <= pcm.Length; offset += FrameBytes)
+        for (var offset = 0; offset < pcm.Length; offset += FrameBytes)
         {
-            Buffer.BlockCopy(pcm, offset, frameBuf, 0, FrameBytes);
+            var bytesAvailable = Math.Min(FrameBytes, pcm.Length - offset);
+            Buffer.BlockCopy(pcm, offset, frameBuf, 0, bytesAvailable);
+            if (bytesAvailable < FrameBytes)
+                Array.Clear(frameBuf, bytesAvailable, FrameBytes - bytesAvailable); // rellena el ultimo frame con silencio
+
             var encoded = _encoder.Encode(frameBuf, frameBuf.Length, out var encodedLength);
-            if (encodedLength <= 0) continue;
-
-            var packet = new UDPVoicePacket
+            if (encodedLength > 0)
             {
-                AudioPart1Bytes = encoded[..encodedLength],
-                AudioPart1Length = (ushort)encodedLength,
-                Frequencies = [freqHz],
-                Modulations = [(byte)modulation],
-                Encryptions = [0],
-                UnitId = _unitId,
-                RetransmissionCount = 0,
-                PacketNumber = ++_packetNumber
-            };
+                var packet = new UDPVoicePacket
+                {
+                    AudioPart1Bytes = encoded[..encodedLength],
+                    AudioPart1Length = (ushort)encodedLength,
+                    Frequencies = [freqHz],
+                    Modulations = [(byte)modulation],
+                    Encryptions = [0],
+                    UnitId = _unitId,
+                    RetransmissionCount = 0,
+                    PacketNumber = ++_packetNumber
+                };
 
-            _udpHandler.Send(packet);
-            await Task.Delay(FrameMs);
+                _udpHandler.Send(packet);
+            }
+
+            await frameTimer.WaitForNextTickAsync();
         }
     }
 

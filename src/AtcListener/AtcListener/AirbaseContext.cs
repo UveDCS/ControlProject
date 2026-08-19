@@ -15,6 +15,8 @@ public sealed class AirbaseContext(AirbaseConfig config, double lat, double lon,
     public string Name => config.Name;
     public double FrequencyHz => config.FrequencyMhz * 1_000_000.0;
     public Modulation Modulation { get; } = Enum.Parse<Modulation>(config.Modulation, ignoreCase: true);
+    public double Lat => lat;
+    public double Lon => lon;
 
     public AtcStateMachine StateMachine { get; } =
         new(config.Runways, config.TaxiRoute, lat, lon, alt, logger);

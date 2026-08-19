@@ -3,6 +3,7 @@ using RurouniJones.Dcs.Grpc.V0.Atmosphere;
 using RurouniJones.Dcs.Grpc.V0.Common;
 using RurouniJones.Dcs.Grpc.V0.Mission;
 using RurouniJones.Dcs.Grpc.V0.Net;
+using RurouniJones.Dcs.Grpc.V0.Unit;
 using RurouniJones.Dcs.Grpc.V0.World;
 
 namespace AtcListener;
@@ -16,6 +17,7 @@ public sealed class DcsWorldClient : IDisposable
     private readonly AtmosphereService.AtmosphereServiceClient _atmosphere;
     private readonly WorldService.WorldServiceClient _world;
     private readonly NetService.NetServiceClient _net;
+    private readonly UnitService.UnitServiceClient _unit;
 
     public DcsWorldClient(string host = "127.0.0.1", int port = 50051)
     {
@@ -24,6 +26,29 @@ public sealed class DcsWorldClient : IDisposable
         _atmosphere = new AtmosphereService.AtmosphereServiceClient(_channel);
         _world = new WorldService.WorldServiceClient(_channel);
         _net = new NetService.NetServiceClient(_channel);
+        _unit = new UnitService.UnitServiceClient(_channel);
+    }
+
+    // Diagnostico: jugadores conectados con su "slot" tal cual lo da DCS-gRPC.
+    public async Task<IReadOnlyList<GetPlayersResponse.Types.GetPlayerInfo>> GetPlayersRawAsync()
+    {
+        var response = await _net.GetPlayersAsync(new GetPlayersRequest(), deadline: DateTime.UtcNow.AddSeconds(5));
+        return response.Players;
+    }
+
+    // Diagnostico: intenta resolver la posicion de una unidad por nombre/slot.
+    public async Task<Position?> TryGetUnitPositionAsync(string unitName)
+    {
+        try
+        {
+            var response = await _unit.GetPositionAsync(new GetPositionRequest { Name = unitName },
+                deadline: DateTime.UtcNow.AddSeconds(5));
+            return response.Position;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Nombres reales de los jugadores conectados en ese momento - se usan como callsigns

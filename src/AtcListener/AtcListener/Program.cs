@@ -32,6 +32,31 @@ const int MaxAirbases = 10; // Constants.MAX_RADIOS de SRS es 11 (radios[0] va s
 var configPath = Path.Combine(AppContext.BaseDirectory, "atc-config.json");
 var config = AtcConfig.LoadOrCreateDefault(configPath, logger);
 
+if (args.Contains("--debug-players"))
+{
+    using var dcs = new DcsWorldClient(config.Grpc.Host, config.Grpc.Port);
+    try
+    {
+        var players = await dcs.GetPlayersRawAsync();
+        logger.Info($"Jugadores conectados: {players.Count}");
+        foreach (var p in players)
+        {
+            logger.Info($"[PLAYER] id={p.Id} name=\"{p.Name}\" slot=\"{p.Slot}\" coalicion={p.Coalition}");
+
+            var pos = await dcs.TryGetUnitPositionAsync(p.Slot);
+            logger.Info(pos != null
+                ? $"  -> GetPosition(slot) OK: lat={pos.Lat:F4} lon={pos.Lon:F4} alt={pos.Alt:F0}"
+                : "  -> GetPosition(slot) FALLO (el slot no es un nombre de unidad valido para UnitService)");
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.Error($"[GRPC] No se pudo conectar - ¿hay una mision corriendo con DCS-gRPC activo? Detalle: {ex.Message}");
+    }
+
+    return;
+}
+
 if (args.Contains("--list-airbases"))
 {
     using var dcs = new DcsWorldClient(config.Grpc.Host, config.Grpc.Port);
@@ -127,12 +152,39 @@ catch (Exception ex)
     logger.Warn($"No se pudo obtener la lista de jugadores via DCS-gRPC ({ex.Message}) - se usaran solo los callsigns fijos de la configuracion.");
 }
 
-var allCallsigns = config.Callsigns
-    .Concat(livePlayerNames)
-    .Select(CallsignNormalizer.ForGrammar)
-    .Where(c => c.Length > 0)
-    .Distinct()
-    .ToArray();
+// Los callsigns asignados a jugadores (config.PlayerCallsigns) evitan el problema de nicks
+// raros, y ademas nos dejan saber a que jugador real de SRS corresponde cada callsign, para
+// poder rastrear su posicion y guiarle en la aproximacion. Un mismo callsign puede tener varios
+// nombres de jugador posibles (p.ej. el nombre en un jugador vs el nick de multijugador).
+var callsignToPlayerNames = new Dictionary<string, List<string>>();
+var callsignList = new List<string>(config.Callsigns.Select(CallsignNormalizer.ForGrammar));
+
+foreach (var mapping in config.PlayerCallsigns)
+{
+    var norm = CallsignNormalizer.ForGrammar(mapping.Callsign);
+    if (norm.Length == 0) continue;
+    callsignList.Add(norm);
+
+    if (!callsignToPlayerNames.TryGetValue(norm, out var names))
+        callsignToPlayerNames[norm] = names = [];
+    names.Add(mapping.PlayerName);
+}
+
+foreach (var playerName in livePlayerNames)
+{
+    var alreadyMapped = config.PlayerCallsigns.Any(m => string.Equals(m.PlayerName, playerName, StringComparison.OrdinalIgnoreCase));
+    if (alreadyMapped) continue; // ya tiene callsign asignado explicitamente arriba
+
+    var norm = CallsignNormalizer.ForGrammar(playerName);
+    if (norm.Length == 0) continue;
+    callsignList.Add(norm);
+
+    if (!callsignToPlayerNames.TryGetValue(norm, out var names))
+        callsignToPlayerNames[norm] = names = [];
+    names.Add(playerName);
+}
+
+var allCallsigns = callsignList.Where(c => c.Length > 0).Distinct().ToArray();
 
 var recognizer = SpeechSetup.CreateRecognizer(logger, allCallsigns);
 if (recognizer == null)
@@ -192,7 +244,7 @@ var srClient = new SRClientBase
 };
 
 var listener = new AtcListenerClient(guid, srClient, endpoint, config.Srs.EamPassword, airbaseContexts,
-    VoiceSampleRate, recognizer, worldClient, config.Voice, logger);
+    VoiceSampleRate, recognizer, worldClient, config.Voice, callsignToPlayerNames, logger);
 await listener.RunAsync();
 
 // ---
@@ -261,9 +313,12 @@ public class AtcListenerClient(
     SpeechRecognitionEngine recognizer,
     DcsWorldClient worldClient,
     string voiceName,
+    Dictionary<string, List<string>> callsignToPlayerNames,
     Logger logger)
     : IHandle<TCPClientStatusMessage>
 {
+    private static readonly TimeSpan GuidanceInterval = TimeSpan.FromSeconds(15);
+
     private TCPClientHandler? _tcpHandler;
     private UDPVoiceHandler? _udpHandler;
     private readonly TaskCompletionSource _stopped = new();
@@ -278,9 +333,10 @@ public class AtcListenerClient(
 
         var listenTask = Task.Run(ListenForVoiceAsync);
         var finalizeTask = Task.Run(WatchForTransmissionEndAsync);
+        var guidanceTask = Task.Run(GuideApproachesAsync);
 
         await _stopped.Task;
-        await Task.WhenAll(listenTask, finalizeTask);
+        await Task.WhenAll(listenTask, finalizeTask, guidanceTask);
     }
 
     public async Task HandleAsync(TCPClientStatusMessage message, CancellationToken cancellationToken)
@@ -357,6 +413,43 @@ public class AtcListenerClient(
                 if (pcm is { Length: > 0 })
                 {
                     await RecognizeAndRespondAsync(airbase, pcm);
+                }
+            }
+        }
+    }
+
+    // Guiado activo por radar: mientras un callsign tenga aproximacion autorizada y no haya
+    // reportado "en final", le llamamos periodicamente con rumbo y distancia reales al campo.
+    // Requiere que SRS reporte la posicion real del jugador (DISTANCE_ENABLED o LOS_ENABLED
+    // en server.cfg) y que el callsign tenga un jugador real asociado (config.PlayerCallsigns,
+    // o su propio nombre de jugador si no tiene uno asignado).
+    private async Task GuideApproachesAsync()
+    {
+        while (!_stopped.Task.IsCompleted)
+        {
+            await Task.Delay(GuidanceInterval);
+
+            foreach (var airbase in airbases)
+            {
+                foreach (var callsign in airbase.StateMachine.GetCallsignsInApproach())
+                {
+                    if (!callsignToPlayerNames.TryGetValue(callsign, out var candidateNames)) continue;
+
+                    var client = ConnectedClientsSingleton.Instance.Values.FirstOrDefault(c =>
+                        candidateNames.Any(n => string.Equals(c.Name, n, StringComparison.OrdinalIgnoreCase)));
+
+                    if (client?.LatLngPosition == null || !client.LatLngPosition.IsValid())
+                    {
+                        logger.Info($"[{airbase.Name}] Sin posicion real de \"{string.Join(" / ", candidateNames)}\" todavia (¿DISTANCE_ENABLED activo en SRS?) - sin guiado esta vuelta.");
+                        continue;
+                    }
+
+                    var (distanceNm, bearingDeg) = GeoMath.DistanceAndBearing(
+                        client.LatLngPosition.lat, client.LatLngPosition.lng, airbase.Lat, airbase.Lon);
+
+                    var name = AtcStateMachine.Capitalize(callsign);
+                    var text = $"{name}, a {distanceNm:F0} millas, rumbo {Math.Round(bearingDeg):F0} grados para el campo";
+                    await SpeakAsync(airbase, text);
                 }
             }
         }
